@@ -1178,11 +1178,16 @@ export class ScriptingAPI {
     /** Mudlet `feedTelnet(data)` — inject imitation server bytes. Refused while
      *  a socket exists in any state but unconnected, so replayed data can never
      *  interleave with a live stream; the message is returned for the binding to
-     *  shape into Mudlet's `(nil, errMsg)`, and null means it was fed. */
-    feedTelnet(data: string): string | null {
+     *  shape into Mudlet's `(nil, errMsg)`, and null means it was fed.
+     *
+     *  The empty string is not data: it asks which version of the byte-tag
+     *  table this client decodes, and feeds nothing (TLuaInterpreter::feedTelnet
+     *  answers `true, "feedTelnet: using table version N"` for it). */
+    feedTelnet(data: string): string | { version: string } | null {
         if (!this.session.isSocketUnconnected()) {
             return 'feedTelnet: refused, telnet connection socket is not in the unconnected state';
         }
+        if (data.length === 0) return { version: decodeTelnetByteTags('') };
         // `data` is a BYTE-STRING: one char per byte, as a socket produces and
         // as everything downstream reads it (MSDP decodes its values from UTF-8
         // bytes, for one). The Lua binding unarmors it into that shape — see
@@ -1555,10 +1560,12 @@ export class ScriptingAPI {
             case 'askTlsAvailable':
                 return selectProfileField(useAppStore.getState(), this.connectionId, 'askTlsAvailable') ?? true;
             // structured — mapper
-            // Mudlet's getConfig reports the *internal* doubles (host.mRoomSize /
-            // host.mLineSize), not the spin-box scale its setConfig takes — see
-            // setConfig below for the (deliberately asymmetric) write side.
-            case 'mapRoomSize':        return this.getMapperField('roomSize');
+            // Mudlet's getConfig reports mapRoomSize in the tenths-of-a-cell
+            // unit its setConfig takes (qRound(mRoomSize * 10)), so a script can
+            // hand the answer straight back; mapExitSize is the internal
+            // mLineSize, which is the unit its setter takes already.
+            case 'mapRoomSize':
+                return Math.round((this.getMapperField('roomSize') ?? MAPPER_DEFAULTS.roomSize) * MUDLET_ROOM_SIZE_SCALE);
             case 'mapExitSize':        return this.mudletExitSize();
             case 'mapRoundRooms':      return this.getMapperField('roomShape') === 'roundedRectangle';
             case 'mapShowRoomBorders': return this.getMapperField('borders');
@@ -1583,6 +1590,11 @@ export class ScriptingAPI {
             // the session rather than the bag
             case 'undoServerWrap':      return this.session.undoServerWrap;
             case 'undoServerWrapWidth': return this.session.undoServerWrapWidth;
+            // Mudlet leaves "matches", "multimatches" and "line" out of the
+            // globals table until a script reads them; Mudlet Web sets them up
+            // front on every dispatch, which is Mudlet with this switched off
+            // (see e2e/knownDivergences.ts).
+            case 'lazyCaptureGlobals':  return false;
             case 'muteMediaAPI':       return this.session.sounds.isOriginMuted('api');
             case 'muteMediaGame':      return this.session.sounds.isOriginMuted('game');
             // read-only
@@ -1699,6 +1711,7 @@ export class ScriptingAPI {
             case 'mapRoundRooms': case 'mapShowRoomBorders':
             case 'mapShowGrid': case 'muteMediaAPI': case 'muteMediaGame':
             case 'mapperPanelVisible': case 'undoServerWrap':
+            case 'lazyCaptureGlobals':
                 return 'bool';
             case 'mapRoomSize': case 'mapExitSize': case 'undoServerWrapWidth':
                 return 'num';
@@ -1904,6 +1917,8 @@ export class ScriptingAPI {
                 this.patchConfigBag('specialForceGAOff', on);
                 return true;
             }
+            // Only the value it already has: see getConfig
+            case 'lazyCaptureGlobals': return !configBool(value);
             // Mudlet Host::mUndoServerWrap — rejoin the lines the game wrapped
             // itself. Live: the line assembler judges the next server line under
             // the new setting, and turning it off commits anything held.
@@ -2617,9 +2632,10 @@ export class ScriptingAPI {
         return this.host.createTempButton(toolbar, name, orientation);
     }
 
-    /** Mudlet `tempButtonToolbar(name [, orientation [, location]])`. Creates
-     *  a transient toolbar (ButtonNode group). `location` int: 0=top, 1=bottom,
-     *  2=left, 3=right, 4=floating. Returns the new id or -1 on duplicate
+    /** Mudlet `tempButtonToolbar(name, location, orientation)` core. Creates
+     *  a transient toolbar (ButtonNode group). `location` is TAction's stored
+     *  int — 0=top, 1=bottom, 2=left, 3=right, 4=floating — which Bridge.lua
+     *  derives from the Lua argument. Returns the new id or -1 on duplicate
      *  name (the Lua wrapper returns nothing then). */
     tempButtonToolbar(name: string, orientation: number, location: number): number {
         return this.host.createTempButtonToolbar(name, orientation, location);
@@ -2627,13 +2643,13 @@ export class ScriptingAPI {
 
     /** Mudlet `setButtonState(name, state)`. Sets the pressed state of a
      *  two-state (push-down) button by name. Returns false when not found. */
-    setButtonState(name: string, state: boolean): boolean {
+    setButtonState(name: string | number, state: boolean): boolean {
         return this.host.setButtonStateByName(name, state);
     }
 
     /** Mudlet `getButtonState(name)`. Reads the pressed state of a two-state
      *  button. Returns nil when not found. */
-    getButtonState(name: string): boolean | null {
+    getButtonState(name: string | number): boolean | null {
         return this.host.getButtonStateByName(name);
     }
 
@@ -2648,7 +2664,7 @@ export class ScriptingAPI {
 
     /** Which of Mudlet's button refusals applies to `name` — see
      *  ScriptingEngine.buttonKindByName. */
-    buttonKind(name: string): 'missing' | 'plain' | 'pushdown' {
+    buttonKind(name: string | number): 'missing' | 'plain' | 'pushdown' {
         return this.host.buttonKindByName(name);
     }
 
@@ -3120,6 +3136,12 @@ export class ScriptingAPI {
             }
             const at = Math.max(0, Math.min(con.getCursorColumn(), buf.text.length));
             buf.insert(at, text, state);
+            if (this.inTriggerProcessing && con === this.mainConsole) {
+                // As for insertText: TConsole::insertLink moves the capture
+                // positions past the link, and the colours go with the text.
+                this.captureShiftHook?.(at, text.length);
+                this.spliceLineColorSnapshot(at, 0, { ...this.stateColorKeys(state), text });
+            }
             if (!this.inTriggerProcessing) buf.rerender();
             return;
         }
@@ -4524,6 +4546,12 @@ export class ScriptingAPI {
             }
             const at = Math.max(0, Math.min(con.getCursorColumn(), buf.text.length));
             buf.insert(at, text, state);
+            if (this.inTriggerProcessing && con === this.mainConsole) {
+                // As for insertText: TConsole::insertLink moves the capture
+                // positions past the link, and the colours go with the text.
+                this.captureShiftHook?.(at, text.length);
+                this.spliceLineColorSnapshot(at, 0, { ...this.stateColorKeys(state), text });
+            }
             if (!this.inTriggerProcessing) buf.rerender();
             return;
         }
@@ -5068,6 +5096,10 @@ export class ScriptingAPI {
         const state = keepColor ? undefined : this.outputConsole(targetWin).format.toSnapshot();
         buf.replace([sel.start, sel.start + sel.length], newText, state);
         if (this.inTriggerProcessing && this.getConsole(targetWin) === this.mainConsole) {
+            // TConsole::replace moves every capture from the start of the
+            // selection on by the change in length, so a later group is still
+            // found where its text now is
+            this.captureShiftHook?.(sel.start, newText.length - sel.length);
             // Same alignment the insert path needs: a replace that changes the
             // line's LENGTH moves every colour run after it. With keepColor the
             // replacement wears whatever the snapshot already had at that
@@ -6331,14 +6363,31 @@ export class ScriptingAPI {
      * value. hotX/hotY are the cursor hotspot in pixels (default 0,0). Returns
      * false when the label doesn't exist.
      */
-    setLabelCustomCursor(name: string, path: string, hotX?: number, hotY?: number): boolean {
-        if (!name || !this.session.labels.has(name)) return false;
-        const url = this.resolveImageUrl(path ?? '');
-        if (!url) return this.session.labels.setCursor(name, undefined);
+    /** Mudlet `setLabelCustomCursor(name, path [, hotX, hotY])`. True when the
+     *  cursor is set, else the refusal in TMainConsole::setLabelCustomCursor's
+     *  words and order: the empty name, the empty location, then — for a label
+     *  that exists — an image it cannot load; a missing label last. */
+    setLabelCustomCursor(name: string, path: string, hotX?: number, hotY?: number): true | string {
+        if (!name) return 'a label cannot have an empty string as its name';
+        if (!path) return 'custom cursor location cannot be an empty string';
+        if (!this.session.labels.has(name)) return `label name '${name}' not found`;
+        if (!this.canLoadImage(path)) return `couldn't find custom cursor, is the location "${path}" correct?`;
+        const url = this.resolveImageUrl(path);
         const x = Number.isFinite(hotX) ? Math.max(0, Math.round(hotX as number)) : 0;
         const y = Number.isFinite(hotY) ? Math.max(0, Math.round(hotY as number)) : 0;
         const escaped = url.replace(/[\\"]/g, '\\$&');
-        return this.session.labels.setCursor(name, `url("${escaped}") ${x} ${y}, auto`);
+        this.session.labels.setCursor(name, `url("${escaped}") ${x} ${y}, auto`);
+        return true;
+    }
+
+    /** Whether an image path names something there to load, as far as can be
+     *  told now: a vendored Qt resource, or a profile file that exists. A
+     *  remote or inline URL cannot be judged synchronously and is taken on
+     *  trust. */
+    private canLoadImage(path: string): boolean {
+        if (isQtResourcePath(path)) return qtResourceUrl(path) !== null;
+        if (/^(?:https?|data|blob):/i.test(path)) return true;
+        try { return this.host.readFileBytes(path) !== null; } catch { return false; }
     }
 
     // ── Label movies ──────────────────────────────────────────────────────────
