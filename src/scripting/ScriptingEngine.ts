@@ -375,6 +375,8 @@ export class ScriptingEngine implements EngineHost {
         // that is not a plain word, or a frame that is not open to act on —
         // can put the tag back into the line it came from.
         onFrame: (frame) => this.api.mxpFrame(frame.name, frame.attrs, frame.dest),
+        // A <DEST> naming a frame that is not open leaves its text in the line.
+        hasFrame: (name) => this.api.mxpHasFrame(name),
     });
     private vfs: ProfileVFS | null = null;
     private readonly runtimeReady: Promise<IScriptingRuntime>;
@@ -1884,7 +1886,7 @@ export class ScriptingEngine implements EngineHost {
             // Perm colorTrigger patterns delegate to the same buffer scan the
             // tempColorTrigger binding uses — both inspect the line that
             // beginLine() just appended to the main console.
-            this.triggerEngine.setColorMatcher((fg, bg, window) => this.api.currentLineColorMatch(fg, bg, window));
+            this.triggerEngine.setColorMatcher((fg, bg, window) => this.api.currentLineColorRuns(fg, bg, window));
             // The runaway-creation report goes to the main console, where the
             // player is already looking at the line it could not finish.
             this.triggerEngine.setRunawayReporter(text => this.api.postSystemMessage(text));
@@ -5093,6 +5095,7 @@ export class ScriptingEngine implements EngineHost {
         for (const link of links) {
             const hl = this.api.createMxpHyperlink(
                 link.kind, link.payload, link.hint, link.prompts?.cmds, link.prompts?.hints,
+                () => this.mxp.isLinkLive(link.id),
             );
             buffer.setHyperlink([link.start, link.end], hl);
         }
