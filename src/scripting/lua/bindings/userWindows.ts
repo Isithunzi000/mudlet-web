@@ -94,7 +94,16 @@ export function installUserWindowBindings({
         // Geyser.UserWindow:setDockPosition, so without it a package could
         // never move a panel out of the side it was born in.
         if (existed && area) api.windows.setDockArea(window, area);
-        else if (!existed) {
+        // Desktop has docked the window, shrunk the main console and raised
+        // sysWindowResizeEvent by the time openUserWindow returns; commit the
+        // layout now so getUserWindowSize / getMainWindowSize / getWindowGeometry
+        // on the very next line agree with it. A window opened floating leaves
+        // the dock layout alone, so it settles nothing: flushing there would
+        // commit some earlier, unrelated change (a dock deleted a line before)
+        // in the middle of a constructor that measured the main window before
+        // the call and resolves its percentages against it straight after.
+        if (api.windows.isDocked(window)) api.windows.settleLayout();
+        if (!existed) {
             api.windows.announceCreatedSize(window);
             // Host::openWindow gives a new user window a font of its own, which
             // desktop announces as sysFontChangeEvent like any font change.
