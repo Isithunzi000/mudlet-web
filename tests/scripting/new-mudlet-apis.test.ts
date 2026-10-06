@@ -133,7 +133,7 @@ describe('addCustomLine', () => {
     rt.run('setExitStub(2, "north", true)');
     // Mudlet reports the refusal as (nil, errMsg), not a bare false.
     expect(rt.run('local _, e = addCustomLine(2, {{0,0,0}}, "north", "squiggle", {0,0,0}, false) return e'))
-      .toMatch(/not a valid line style/);
+      .toBe('line style must be "solid line", "dot line", "dash line", "dash dot line" or "dash dot dot line", got "squiggle"');
   });
 });
 
@@ -145,7 +145,8 @@ describe('setWindowWrapIndent / setWindowWrapHangingIndent', () => {
   it('accepts the main window and rejects an unknown named window', () => {
     expect(rt.run('return setWindowWrapIndent("main", 4)')).toBe(true);
     expect(rt.run('return setWindowWrapHangingIndent("main", 2)')).toBe(true);
-    expect(rt.run('return setWindowWrapIndent("nope", 4)')).toBe(false);
+    expect(rt.run('return select("#", setWindowWrapIndent("nope", 4))')).toBe(2);
+    expect(rt.run('return select(2, setWindowWrapIndent("nope", 4))')).toBe('window "nope" not found');
   });
 });
 

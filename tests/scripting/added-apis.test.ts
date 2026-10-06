@@ -122,9 +122,11 @@ describe('echoPopup / insertPopup / setPopup', () => {
     expect(env.run('return (getCurrentLine("tb"))')).toBe('ABXXCD');
   });
 
-  it('setPopup returns false with no selection and true once a selection exists', () => {
+  // Desktop's setPopup answers true for any console it finds, selection or
+  // not (ConsoleLinksByName_spec); there is just nothing for it to attach to.
+  it('setPopup returns true with no selection and once a selection exists', () => {
     env.run('createBuffer("tb"); cecho("tb", "<red>Hello<reset>\\n")');
-    expect(env.run('return (setPopup("tb", {"look"}, {"Look"}))')).toBe(false);
+    expect(env.run('return (setPopup("tb", {"look"}, {"Look"}))')).toBe(true);
     env.run('selectCurrentLine("tb")');
     expect(env.run('return (setPopup("tb", {"look"}, {"Look"}))')).toBe(true);
   });
@@ -1129,7 +1131,7 @@ describe('Mudlet-API batch — Lua bindings', () => {
       .toContain('does not exist');
     // A type there is no family for is told apart from a plain miss.
     expect(env.run('local _, err = isAncestorsActive(1, "sandwich"); return err'))
-      .toContain("invalid item type 'sandwich' given");
+      .toBe('item type must be "alias", "button", "script", "keybind", "timer" or "trigger", got "sandwich"');
   });
 
   it('setModuleInfo / setPackageInfo are callable (no-op without an install)', () => {
