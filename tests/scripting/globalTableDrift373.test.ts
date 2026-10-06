@@ -132,10 +132,12 @@ describe('global-table drift vs Mudlet PTB (#373)', () => {
             expect(t.run('return speedWalkDir == nil and speedWalkPath == nil and speedWalkWeight == nil')).toBe(true);
         });
 
-        it('namedCaptures is nil, and nil again after a fire', () => {
+        it('namedCaptures is nil, during a fire and after it', () => {
             expect(t.run('return namedCaptures == nil')).toBe(true);
-            t.rt.runWithMatches('R373 = namedCaptures and namedCaptures.hp', 'drift', ['HP 137', '137'], undefined, { hp: '137' });
-            expect(t.run('return R373')).toBe('137');
+            // Named groups live only in matches; desktop never sets namedCaptures (#374)
+            t.rt.runWithMatches('R373 = { namedCaptures == nil, matches.hp }', 'drift', ['HP 137', '137'], undefined, { hp: '137' });
+            expect(t.run('return R373[1]')).toBe(true);
+            expect(t.run('return R373[2]')).toBe('137');
             expect(t.run('return namedCaptures == nil')).toBe(true);
         });
     });
