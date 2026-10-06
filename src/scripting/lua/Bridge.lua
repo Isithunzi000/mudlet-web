@@ -1100,15 +1100,17 @@ function setFont(a, b)
     return nil, "window \"" .. tostring(name) .. "\" not found"
 end
 
--- Mudlet setMiniConsoleFontSize(name, size). Mudlet returns (nil, "setting
--- font size of '<name>' failed") when the miniconsole is missing or the size
--- is invalid; the raw primitive returns false for both, so we re-shape here.
-function setMiniConsoleFontSize(name, size)
-    if (tonumber(size) or 0) <= 0 then
-        return nil, "size cannot be 0 or negative"
+-- Mudlet setMiniConsoleFontSize([name,] size). Desktop registers it as another
+-- name for setFontSize, so it answers exactly as that does: main when no name is
+-- given, and "window ... not found" for a name it can't resolve (mudlet-web#380).
+-- Varargs, so a lone size stays one argument for setFontSize's own count. The
+-- setFontSize above rather than the global: desktop's is C and never calls a
+-- Lua `setFontSize` a script put in its place (mudlet-web#374).
+do
+    local stockSetFontSize = setFontSize
+    function setMiniConsoleFontSize(...)
+        return stockSetFontSize(...)
     end
-    if __setMiniConsoleFontSize(name, size) then return true end
-    return nil, "setting font size of '" .. tostring(name) .. "' failed"
 end
 
 function getFont(a)
@@ -1370,7 +1372,7 @@ do
     getUserWindowStyleSheet = userWindowGetter(__getUserWindowStyleSheet, "getUserWindowStyleSheet",
         "a userwindow cannot have an empty string as its name", "userwindow name '%s' not found")
 
-    -- resetUserWindowTitle(name) — back to the generated "<profile> - <name>".
+    -- resetUserWindowTitle(name) — back to the generated "User window - <profile> - <name>".
     function resetUserWindowTitle(name)
         return setUserWindowTitle(name, nil)
     end
@@ -2185,7 +2187,9 @@ do
         if kind == 'label' then
             return false, "label '" .. tostring(name) .. "' already exists"
         end
-        if kind == 'miniconsole' or kind == 'userwindow' then
+        -- A buffer lives in the same console map as a miniconsole on desktop,
+        -- so it blocks the name just the same (mudlet-web#380).
+        if kind == 'miniconsole' or kind == 'userwindow' or kind == 'buffer' then
             return false, "a miniconsole/userwindow with the name '" .. tostring(name)
                 .. "' already exists"
         end
@@ -2195,12 +2199,21 @@ do
 
     -- These two are not refusals: the existing widget IS moved and resized, and
     -- the false is only how Mudlet says "I reused what was there".
-    local function reuseReporter(raw, kind, noun)
+    --
+    -- createMiniConsole also meets the other consoles desktop keeps in the same
+    -- maps (TMainConsole::createMiniConsole): a buffer of that name is moved and
+    -- resized like a miniconsole and stays a buffer, while a user window is
+    -- refused outright and left as it was (mudlet-web#380).
+    local function reuseReporter(raw, kind, noun, alsoReuses, refuses)
         return function(...)
             local a = { ... }
             local parented = type(a[1]) == 'string' and type(a[2]) == 'string'
             local name = parented and a[2] or a[1]
-            local existed = __windowType(name) == kind
+            local found = __windowType(name)
+            if refuses and found == refuses then
+                return false, "miniconsole/userwindow '" .. tostring(name) .. "' already exists"
+            end
+            local existed = found == kind or (alsoReuses ~= nil and found == alsoReuses)
             __mudlet_forget_geometry(name)
             local r = raw(...)
             if existed then
@@ -2210,7 +2223,7 @@ do
             return r
         end
     end
-    createMiniConsole = reuseReporter(createMiniConsole, 'miniconsole', 'miniconsole')
+    createMiniConsole = reuseReporter(createMiniConsole, 'miniconsole', 'miniconsole', 'buffer', 'userwindow')
     createScrollBox   = reuseReporter(createScrollBox,   'scrollbox',   'scrollBox')
 
     -- openUserWindow(name [, loadLayout [, autoDock [, area]]]). Every argument
@@ -5683,11 +5696,12 @@ end
 -- kept because packages written against it are still in circulation. It targets
 -- labels and miniconsoles alike, which is exactly what echo already does. The
 -- echo above rather than the global: desktop's is C and never calls a Lua
--- `echo` a script put in its place (mudlet-web#374).
+-- `echo` a script put in its place (mudlet-web#374). Unlike echo it hands
+-- nothing back, as desktop's returns no values (mudlet-web#380).
 do
     local stockEcho = echo
     function echoUserWindow(windowName, text)
-        return stockEcho(windowName, text)
+        stockEcho(windowName, text)
     end
 end
 
