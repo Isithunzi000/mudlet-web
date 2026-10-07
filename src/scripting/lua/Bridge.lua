@@ -695,6 +695,13 @@ function addCustomLine(roomID, id_to, direction, style, color, arrow)
                             .. ' expected, but got a ' .. type(value) .. ' as the ' .. AXES[j]
                             .. '-coordinate at that index!)', 2)
                     end
+                    -- Room coordinates are ints: anything past them, NaN and
+                    -- the infinities included, is refused as it is walked
+                    local n = tonumber(value)
+                    if not (n >= -2147483648 and n <= 2147483647) then
+                        return nil, 'addCustomLine: the ' .. AXES[j] .. '-coordinate of point #' .. i
+                            .. ' is outside the range of room coordinates'
+                    end
                     present = present + 1
                 end
                 coords[j] = tostring(value == nil and 0 or value)
@@ -1349,7 +1356,8 @@ do
     -- first, matching the order Mudlet resolves them in. Only the "no such
     -- name" cases become (nil, message); the raw result is passed straight
     -- through otherwise, because it still says false for moves that exist but
-    -- are illegal (reparenting a userwindow, or making a cycle).
+    -- are illegal (reparenting a userwindow). A cycle is refused with desktop's
+    -- message, which the raw binding hands back as a string.
     local _rawSetWindow = setWindow
     function setWindow(parent, element, ...)
         -- The TYPE is settled before the lookup: a table where a name belongs is
@@ -1377,7 +1385,12 @@ do
         -- old coordinates that Geyser's changeContainer issues right after
         -- looks like a no-op and the widget stays at 0,0.
         __mudlet_forget_geometry(element)
-        return _rawSetWindow(parent, element, ...)
+        local result = _rawSetWindow(parent, element, ...)
+        -- a move that would make a parent cycle comes back as its message
+        if type(result) == 'string' then
+            return nil, result
+        end
+        return result
     end
 
     -- `what` names argument #1 the way Mudlet's own message does, and the
@@ -4865,33 +4878,35 @@ do
     -- A body that does not compile still makes the trigger (see
     -- __mudlet_to_fn), but TTrigger::setScript leaves it unable to fire or to
     -- report active, as tempAlias does — so the engine is told.
+    -- The third answer is whether the body is the empty script, which desktop
+    -- never calls: such a fire leaves `matches` as the last script left it.
     local function body(fn, who, argN)
         local compiled = __mudlet_to_fn(fn, who, argN)
-        return __mudlet_register_cb(compiled), __mudlet_uncompiled[compiled] == true
+        return __mudlet_register_cb(compiled), __mudlet_uncompiled[compiled] == true, fn == ''
     end
     local _sub = __mudlet_tempTrigger
     function tempTrigger(pattern, fn, expirationCount)
         pattern = __mudlet_check_string(pattern, "tempTrigger", 1, "pattern")
-        local cb, uncompiled = body(fn, "tempTrigger", 2)
-        return _sub(pattern, cb, expirationCount, uncompiled)
+        local cb, uncompiled, noScript = body(fn, "tempTrigger", 2)
+        return _sub(pattern, cb, expirationCount, uncompiled, noScript)
     end
     local _re = __mudlet_tempRegexTrigger
     function tempRegexTrigger(pattern, fn, expirationCount)
         pattern = __mudlet_check_string(pattern, "tempRegexTrigger", 1, "pattern")
-        local cb, uncompiled = body(fn, "tempRegexTrigger", 2)
-        return _re(pattern, cb, expirationCount, nil, uncompiled)
+        local cb, uncompiled, noScript = body(fn, "tempRegexTrigger", 2)
+        return _re(pattern, cb, expirationCount, nil, uncompiled, noScript)
     end
     local _ex = __mudlet_tempExactMatchTrigger
     function tempExactMatchTrigger(pattern, fn, expirationCount)
         pattern = __mudlet_check_string(pattern, "tempExactMatchTrigger", 1, "pattern")
-        local cb, uncompiled = body(fn, "tempExactMatchTrigger", 2)
-        return _ex(pattern, cb, expirationCount, uncompiled)
+        local cb, uncompiled, noScript = body(fn, "tempExactMatchTrigger", 2)
+        return _ex(pattern, cb, expirationCount, uncompiled, noScript)
     end
     local _bol = __mudlet_tempBeginOfLineTrigger
     function tempBeginOfLineTrigger(pattern, fn, expirationCount)
         pattern = __mudlet_check_string(pattern, "tempBeginOfLineTrigger", 1, "pattern")
-        local cb, uncompiled = body(fn, "tempBeginOfLineTrigger", 2)
-        return _bol(pattern, cb, expirationCount, uncompiled)
+        local cb, uncompiled, noScript = body(fn, "tempBeginOfLineTrigger", 2)
+        return _bol(pattern, cb, expirationCount, uncompiled, noScript)
     end
     -- tempPromptTrigger(fn[, expirationCount]) — fires whenever the server sends
     -- a prompt (no pattern). The callback is arg #1, so __mudlet_to_fn looks there.
@@ -5576,17 +5591,48 @@ end
 -- then the console is looked for (__mudlet_console_missing), BEFORE any
 -- function is stored — a call that is refused or raises keeps no function.
 do
-    local _fns = {}
+    -- Each function is held straight in the registry, as desktop holds a link's
+    -- function by a registry reference: ConsoleClipboardByName_spec counts
+    -- those references. String keys keep clear of luaL_ref's integer slots.
+    local registry = debug.getregistry()
     local _id  = 0
-    function __mudlet_call_link(id) _fns[id]() end
+    local function key(id) return 'mudlet-web link ' .. id end
+    function __mudlet_call_link(id) registry[key(id)]() end
 
     -- Store a Lua function and return the Lua code that calls it. tostring()
     -- on the function would give "function: 0x…", which runs as nothing when
     -- clicked.
     function __mudlet_link_ref(fn)
         _id = _id + 1
-        _fns[_id] = fn
+        registry[key(_id)] = fn
         return '__mudlet_call_link(' .. _id .. ')'
+    end
+
+    -- The clipboard holds a reference of its own to every function a link it
+    -- copied calls, and lets go of them when it is given something else to
+    -- hold (TBuffer's copied link store). copy() always replaces the
+    -- clipboard, and cut() is a copy() and a deletion.
+    local clipboardHeld = 0
+    local function holdClipboardLinks()
+        for i = 1, clipboardHeld do
+            registry['mudlet-web clipboard link ' .. i] = nil
+        end
+        clipboardHeld = 0
+        for id in __clipboardLinkCommands():gmatch('__mudlet_call_link%((%d+)%)') do
+            clipboardHeld = clipboardHeld + 1
+            registry['mudlet-web clipboard link ' .. clipboardHeld] = registry[key(tonumber(id))]
+        end
+    end
+    local _rawCopy, _rawCut = copy, cut
+    function copy(...)
+        local result = _rawCopy(...)
+        holdClipboardLinks()
+        return result
+    end
+    function cut(...)
+        local result = _rawCut(...)
+        holdClipboardLinks()
+        return result
     end
 
     -- A popup or link command is Lua code or a Lua function, as in Mudlet.
@@ -7282,7 +7328,21 @@ do
         end
         local env = sandbox()
         setfenv(chunk, env)
-        local ok, runtimeError = pcall(chunk)
+        -- A manifest that never finishes would hang the page, so it runs on a
+        -- thread of its own under the instruction budget desktop gives it (a
+        -- real one is a few assignments). Once spent, every instruction
+        -- raises, so a pcall() in the manifest cannot swallow it.
+        local rawSethook = debug.getregistry()['mudlet.rawSethook']
+        local co = coroutine.create(chunk)
+        local function outOfTime()
+            rawSethook(co, outOfTime, '', 1)
+            error('it ran for too long and was stopped', 2)
+        end
+        rawSethook(co, outOfTime, '', 10000000)
+        local ok, runtimeError = coroutine.resume(co)
+        if ok and coroutine.status(co) ~= 'dead' then
+            ok, runtimeError = false, 'it yielded rather than finishing'
+        end
         if not ok then
             __mudlet_cfg_reason = tostring(runtimeError)
             return

@@ -3174,6 +3174,7 @@ export class ScriptingAPI {
         const hyperlink: FormatHyperlink = {
             onClick: () => { this.host.runLinkCode(cmd); },
             title: tooltip || undefined,
+            luaCommands: [cmd],
         };
         const con = this.penConsole(win);
         if (!con) return;
@@ -3214,8 +3215,9 @@ export class ScriptingAPI {
     private buildPopupHyperlink(
         cmds: string[],
         hints: string[],
-        action: (cmd: string) => void = (cmd) => { this.host.runLinkCode(cmd); },
+        customAction?: (cmd: string) => void,
     ): FormatHyperlink {
+        const action = customAction ?? ((cmd: string) => { this.host.runLinkCode(cmd); });
         // More hints than commands means hints[0] is a tooltip and the menu
         // labels start one later; otherwise every hint labels its command and
         // the tooltip is all of them, one per line.
@@ -3276,6 +3278,7 @@ export class ScriptingAPI {
             onClick: first ? () => { action(first); } : undefined,
             onContextMenu: hasMenu ? openMenu : undefined,
             title: hintOffset ? hints[0] : hints.join('\n'),
+            luaCommands: customAction ? undefined : [...cmds],
         };
     }
 
@@ -4027,6 +4030,7 @@ export class ScriptingAPI {
         const hyperlink: FormatHyperlink = {
             onClick: () => { this.host.runLinkCode(cmd); },
             title: tooltip || undefined,
+            luaCommands: [cmd],
         };
         const span = this.selectionSpan(sel, buf);
         if (span) buf.setHyperlink(span, hyperlink);
@@ -5090,6 +5094,7 @@ export class ScriptingAPI {
             const hyperlink: FormatHyperlink = {
                 onClick: () => { this.host.runLinkCode(cmd); },
                 title: tooltip || undefined,
+                luaCommands: [cmd],
             };
             const state: FormatStateSnapshot = useCurrentFormat
                 ? { ...con.format.toSnapshot(), hyperlink }
@@ -5507,6 +5512,17 @@ export class ScriptingAPI {
         return true;
     }
 
+    /** The Lua code of every scripted link in the clipboard, for Bridge.lua to
+     *  hold a reference of the clipboard's own to each function a link calls,
+     *  as TBuffer's copied TLinkStore does in desktop. */
+    clipboardLinkCommands(): string[] {
+        const commands: string[] = [];
+        for (const segment of this.clipboard?.getSegments() ?? []) {
+            commands.push(...(segment.state?.hyperlink?.luaCommands ?? []));
+        }
+        return commands;
+    }
+
     /**
      * Mudlet `cut()`. `copy()` and then delete what was copied, so the clipboard
      * holds exactly the text the line lost (TConsole::cut → TBuffer::cut). Takes
@@ -5716,7 +5732,10 @@ export class ScriptingAPI {
         return this.labels.get(name)?.html ?? null;
     }
 
-    setWindow(windowName: string, name: string, x = 0, y = 0, show = true): boolean {
+    /** A move that would make a parent cycle answers desktop's refusal message
+     *  (TMainConsole::reparentWindow) rather than false, for Bridge.lua to
+     *  return as (nil, message). */
+    setWindow(windowName: string, name: string, x = 0, y = 0, show = true): boolean | string {
         const wm = this.session.windows;
         if (windowName !== 'main' && !wm.has(windowName) && !this.scrollBoxes.has(windowName)) {
             return false;
@@ -5742,7 +5761,7 @@ export class ScriptingAPI {
             // descendants would recurse forever in ScrollBoxOverlay.
             for (let p: string | undefined = windowName; p && p !== 'main';
                  p = this.scrollBoxes.get(p)?.parent) {
-                if (p === name) return false;
+                if (p === name) return `element '${name}' cannot be moved into itself or into one of its own children`;
             }
             this.scrollBoxes.setParent(name, windowName);
             this.scrollBoxes.move(name, x, y);

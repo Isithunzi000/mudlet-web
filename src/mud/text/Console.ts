@@ -72,7 +72,7 @@ export class Console {
      * about: deleteLine() removing the open line itself, which is what
      * clearWindow() followed by deleteLine() does. That is the only way to a
      * buffer of zero lines, and telling it apart from a one-line buffer is
-     * precisely what getLines()'s out-of-range answer exists for.
+     * precisely what getLines() answering an empty table exists for.
      */
     private hasOpenLine = true;
     private cursorIdx = -1; // -1 = always resolve to last line
@@ -847,24 +847,23 @@ export class Console {
     }
 
     /**
-     * Mudlet `getLines(from, to)` — the lines starting at the 0-based index
-     * `from`, `abs(to - from)` of them (TConsole::getLines). `to` is exclusive
-     * and neither bound is clamped: the result always holds exactly
-     * `abs(to - from)` entries, and an index outside the buffer contributes
-     * {@link BAD_LINE_ERROR} rather than being dropped.
+     * Mudlet `getLines(from, to)` — the lines from the 0-based index `from`
+     * up to, not including, `from + abs(to - from)` (TConsoleModel::lines).
+     * Only lines the buffer actually holds are returned: an index before line
+     * 0 or past the last line is dropped rather than padded, so the result can
+     * be shorter than asked for, and empty. A negative `from` still spends its
+     * share of the count — `getLines(-2, 3)` reads lines 0 to 2, not 0 to 4.
      *
-     * That sentinel is the only way a script can tell an empty buffer from a
+     * An empty table is the only way a script can tell an empty buffer from a
      * one-line one, because getLineCount() answers 0 for both — it reports the
-     * last line's index. Mudlet's TBuffer::line() is the shape being matched:
-     * it answers every out-of-range index with the same string rather than
-     * failing.
+     * last line's index.
      */
     getLines(from: number, to: number): string[] {
-        const start = Math.trunc(from);
-        const count = Math.abs(Math.trunc(to) - start);
+        const first = Math.trunc(from);
+        const end = Math.min(first + Math.abs(first - Math.trunc(to)), this.lineTotal);
         const lines: string[] = [];
-        for (let i = 0; i < count; i++) {
-            lines.push(this.lineAt(start + i) ?? BAD_LINE_ERROR);
+        for (let i = Math.max(first, 0); i < end; i++) {
+            lines.push(this.lineAt(i) ?? '');
         }
         return lines;
     }
@@ -1051,13 +1050,17 @@ export const BLANK_TIMESTAMP = '------------ ';
  * Split `buf` into the lines a console of `width` columns stores it as, or
  * null when it needs no splitting. Mudlet's TBuffer::wrapLine: an indent as
  * wide as the window is dropped rather than wrapping the text into single
- * characters, the first line takes `indent` and the continuations
+ * characters, one wider than half the window is held to half, the first line takes `indent` and the continuations
  * `hangingIndent` (a line that is itself a continuation takes the latter
  * throughout), and every continuation is marked as one.
  */
 function wrapBuffer(buf: AnsiAwareBuffer, width: number, indent: number, hangingIndent: number): AnsiAwareBuffer[] | null {
-    const firstIndent = indent > 0 && indent < width ? Math.trunc(indent) : 0;
-    const hang = hangingIndent > 0 && hangingIndent < width ? Math.trunc(hangingIndent) : 0;
+    // Each wrapped line pads indent columns per (width - indent) of text, so an
+    // indent is held to half the width: near the width a long line would become
+    // one padded line per character
+    const half = Math.trunc(width / 2);
+    const firstIndent = indent > 0 && indent < width ? Math.min(Math.trunc(indent), half) : 0;
+    const hang = hangingIndent > 0 && hangingIndent < width ? Math.min(Math.trunc(hangingIndent), half) : 0;
     const pieces = wrapInfo(buf.text, !buf.continuation, width, firstIndent, hang);
     if (pieces.length === 0) return null;
 
