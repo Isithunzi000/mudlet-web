@@ -82,7 +82,7 @@ import {MapOpenNotifier} from './MapOpenNotifier';
 import {installPackageFonts, refreshPackageFonts} from '../import/packageFonts';
 import {installPackageFromBytes, moduleXmlAbsolutePath, prepareModuleInstallFromVfsPath, preparePackageInstall, reloadModuleFromVfs, uninstallPackageFiles} from '../import/packageInstaller';
 import type {MudletImportResult} from '../import/mudletXmlImport';
-import {clientGuiDeclinesBaseUi, downloadFromUrl, filenameFromUrl, isClientGuiRedelivery, parseClientGuiPayload, parseClientMapPayload} from '../import/remotePackageInstall';
+import {clientGuiDeclinesBaseUi, clientGuiPackageName, downloadFromUrl, filenameFromUrl, isClientGuiRedelivery, parseClientGuiPayload, parseClientMapPayload} from '../import/remotePackageInstall';
 import {ensureDefaultPackages} from '../import/defaultPackages';
 import {serializeMudletXml, type SerializeInput} from '../import/mudletXmlExport';
 import {isMudletProfileVfs, readNewestParseableXml} from '../import/mudletLink';
@@ -514,10 +514,21 @@ export class ScriptingEngine implements EngineHost {
     // (destroy) or on page unload, whichever comes first.
     private exitFired = false;
     // The map save runs after sysExitEvent so edits its handlers make are kept.
-    private readonly beforeUnload = () => {
+    // pagehide, not beforeunload: beforeunload comes before the "Leave site?"
+    // prompt a live connection raises (MudSession), so a player who chose to
+    // stay had already had their exit event — and never got another. pagehide
+    // fires only once the page is really going. The files its handlers write
+    // still reach IndexedDB: the profile VFS commits each sync write's
+    // transaction itself (commitSyncWritesImmediately).
+    private readonly onPageHide = () => {
         this.fireExit();
         this.flushProfileData();
         this.session.windows.flushMapSaveSync();
+    };
+    // A page put in the back/forward cache comes back alive, so its next real
+    // exit raises the event again.
+    private readonly onPageShow = (event: PageTransitionEvent) => {
+        if (event.persisted && !this.disposed) this.exitFired = false;
     };
 
     // Mudlet's permScript/permRegexTrigger/setScript return a numeric script id;
@@ -673,8 +684,9 @@ export class ScriptingEngine implements EngineHost {
         session.sounds.onMediaCaption = (info) => this.printClosedCaption(info);
         // Mudlet fires sysExitEvent as the profile shuts down. The engine is
         // torn down on connection switch/unmount (destroy), but a full page
-        // unload skips React cleanup — cover that with a beforeunload hook.
-        window.addEventListener('beforeunload', this.beforeUnload);
+        // unload skips React cleanup — cover that with a pagehide hook.
+        window.addEventListener('pagehide', this.onPageHide);
+        window.addEventListener('pageshow', this.onPageShow);
         this.scriptsLoaded = new Promise<void>(resolve => { this.resolveScriptsLoaded = resolve; });
         // The VFS is injected already-mounted; the engine builds its runtime over
         // it but never mounts/unmounts (App owns that lifecycle).
@@ -774,6 +786,16 @@ export class ScriptingEngine implements EngineHost {
             // Saved Lua globals go back into _G before any script runs, so script
             // bodies and sysLoadEvent handlers see their persisted state.
             this.restoreSavedVariables();
+            // Fonts do not survive a page load, so every installed package's are
+            // re-registered — desktop's `Host::refreshPackageFonts`
+            // (Host.cpp:3529), without which a package's font would work until
+            // the tab was closed and then silently stop. Before any script runs,
+            // so a script body or a sysLoadEvent handler that sets the package's
+            // font finds it in getAvailableFonts() (#438): each face is listed
+            // as its load starts. Default packages installed above are covered
+            // too; their notifyPackageInstalled below repeats it for nothing,
+            // since loadFontFromVfs is idempotent.
+            this.refreshInstalledPackageFonts();
             // The saved triggers are compiled only once PCRE is ready, below —
             // after the scripts have run. Reserve their firing order now so a
             // temp trigger a script creates at load time fires after them, as
@@ -895,14 +917,6 @@ export class ScriptingEngine implements EngineHost {
             // called for them — fire it now that their own scripts are loaded
             // (applyScriptsFromStore, above) and can see it.
             for (const name of freshlyInstalledPackages) this.notifyPackageInstalled(name);
-            // Fonts do not survive a page load, so every already-installed
-            // package's are re-registered here — desktop's
-            // `Host::refreshPackageFonts` (Host.cpp:3529), and the half without
-            // which a package's font would work until the tab was closed and
-            // then silently stop. Freshly-installed ones were done just above by
-            // notifyPackageInstalled; loadFontFromVfs is idempotent, so the
-            // overlap costs nothing.
-            this.refreshInstalledPackageFonts();
             this.api.flushOutput();
 
             // Capture the merged boot state (loaded file + freshly-installed default
@@ -2314,12 +2328,13 @@ export class ScriptingEngine implements EngineHost {
      * never handed to the browser, so nothing in the profile could use it and
      * nothing said why (issue #103).
      *
-     * Fire-and-forget: `FontFace.load()` is async and every caller of
-     * `notifyPackageInstalled` is not, and a font is not a reason to hold up an
-     * install that has otherwise succeeded — desktop's `loadFont` reports and
-     * carries on too. The consequence is that a package whose *own* install
-     * handler measures its font may run a frame early; the alternative is
-     * making every install path async for the rare package that ships one.
+     * The faces are in `document.fonts` — so `getAvailableFonts()` lists them
+     * and `setFont` takes them — before this returns, which is before the
+     * caller raises sysInstall/sysInstallPackage: a package that sets its own
+     * font in its install handler finds it there, as on desktop (#438). Only
+     * the parse finishes later (`FontFace.load()` is async), and a font is not
+     * a reason to hold up an install that has otherwise succeeded — desktop's
+     * `loadFont` reports and carries on too.
      *
      * Failures reach the error log rather than the console, because a font that
      * will not load is a defect in the package, which is exactly what the
@@ -2340,23 +2355,6 @@ export class ScriptingEngine implements EngineHost {
         });
     }
 
-    /**
-     * Register the fonts one just-installed package ships — desktop's
-     * `Host::installPackageFonts` (Host.cpp:3513), called from `installPackage`
-     * at :2802. Without it a package's font unpacked correctly and was then
-     * never handed to the browser, so nothing in the profile could use it and
-     * nothing said why (issue #103).
-     *
-     * Fire-and-forget: `FontFace.load()` is async and every caller of
-     * `notifyPackageInstalled` is not, and a font is not a reason to hold up an
-     * install that has otherwise succeeded — desktop's `loadFont` reports and
-     * carries on too. The consequence is that a package whose *own* install
-     * handler measures its font may run a frame early; the alternative is
-     * making every install path async for the rare package that ships one.
-     *
-     * Failures reach the error log rather than the console, because a font that
-     * will not load is a defect in the package, which is exactly what the
-     * Errors tab is for.
     /**
      * Raise sysUninstall / sysUninstallPackage. Call this BEFORE removing the
      * package's items from the store so the package's own handlers (and the
@@ -2904,18 +2902,38 @@ export class ScriptingEngine implements EngineHost {
         // Mudlet does without a word; this keeps the install itself honest.
         if (!this.serverGuiAccepted()) return;
 
-        // Same URL already installed, and the server names no newer delivery
-        // revision → no-op. Compared against sourceVersion (what the server
-        // said last time), never the package's own version — see
-        // isClientGuiRedelivery for why an absent version means "skip".
-        const existing = (useAppStore.getState().connectionPackages[this.connectionId] ?? [])
-            .find(p => p.sourceUrl === url);
+        // Already installed, and the server names no newer delivery revision →
+        // no-op. Compared against sourceVersion (what the server said last
+        // time), never the package's own version — see isClientGuiRedelivery.
+        // Found by its URL, or else by the name desktop derives from that URL,
+        // which is how desktop finds it: a package the player installed by hand
+        // is then upgraded (from version -1, nothing having been recorded)
+        // rather than installed over.
+        const installed = useAppStore.getState().connectionPackages[this.connectionId] ?? [];
+        const urlName = clientGuiPackageName(url);
+        const existing = installed.find(p => p.sourceUrl === url)
+            ?? installed.find(p => p.kind !== 'module' && p.name === urlName);
         if (isClientGuiRedelivery(existing, version)) return;
 
         const vfs = this.vfs;
         if (!vfs) {
             this.api.printError(`[Client.GUI] no profile VFS available`);
             return;
+        }
+
+        // An upgrade takes the old version out first, through the ordinary
+        // uninstall (cTelnet::handleGUIPackageInstallationAndUpgrade): its
+        // sysUninstall/sysUninstallPackage handlers tear down what it built,
+        // and its items and files go. Installing over it instead left the old
+        // version's event handlers running beside the new one's.
+        if (existing) {
+            this.postMainMessage(`[ INFO ]  - Upgrading the GUI to new version '${version}' from version `
+                + `'${existing.sourceVersion ?? '-1'}' (url='${url}').`);
+            if (!this.uninstallPackageByName(existing.name)) {
+                this.postMainMessage(`[ WARN ]  - Could not remove "${existing.name}" to upgrade it. `
+                    + 'The game will offer the upgrade again.');
+                return;
+            }
         }
 
         const displayName = filenameFromUrl(url).replace(/\.[^.]+$/, '') || 'package';
@@ -4921,7 +4939,8 @@ export class ScriptingEngine implements EngineHost {
         // subsystem is still fully live for phase 2.
         this.disposed = true;
         this.pendingConnectUrl = null;
-        window.removeEventListener('beforeunload', this.beforeUnload);
+        window.removeEventListener('pagehide', this.onPageHide);
+        window.removeEventListener('pageshow', this.onPageShow);
 
         // ── Phase 2: user code, against an intact engine ─────────────────────
         // sysExitEvent dispatches into Lua synchronously, so handlers run to

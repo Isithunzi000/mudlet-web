@@ -454,6 +454,22 @@ export interface PlatformDivergence {
 
 export const PLATFORM_DIVERGENCES: PlatformDivergence[] = [
     {
+        api: 'files written in sysExitEvent on a profile linked to a local folder',
+        behaviour:
+            'Desktop: a file a sysExitEvent handler writes as Mudlet closes is on disk afterwards. Mudlet Web: '
+            + 'the same on an ordinary (IndexedDB) profile; on a profile linked to a folder on disk, a write made '
+            + 'as the tab closes or reloads can be lost. Writes made while playing reach the folder as before.',
+        reason:
+            'The folder link goes through the File System Access API, which has no synchronous write: every '
+            + 'write opens a writable stream and closes it over several turns of the event loop, and a page that '
+            + 'is closing gets none. IndexedDB can be told to finish on its own (the profile VFS commits each '
+            + 'write\'s transaction explicitly, so the database completes it after the page is gone), and that is '
+            + 'what closes the gap for the default storage; the File System Access API offers no equivalent. '
+            + 'Holding the tab open until the writes land would take a "Leave site?" prompt on every close. '
+            + 'Pinned for IndexedDB by tests/scripting/vfsUnloadCommit438.test.ts.',
+        issue: '#438',
+    },
+    {
         api: 'trigger and alias regex: PCRE2 10.34 in 16-bit mode',
         behaviour:
             'Desktop matches with PCRE2 10.39 over UTF-8; Mudlet Web with 10.34 over UTF-16. So: letters '
@@ -469,6 +485,41 @@ export const PLATFORM_DIVERGENCES: PlatformDivergence[] = [
             + 'release (rejecting \\K in lookarounds, say) would need a PCRE pattern parser in front of PCRE and '
             + 'still could not supply the newer Unicode tables. Pinned by tests/triggers/regexDrift361.test.ts.',
         issue: '#361',
+    },
+    {
+        api: 'trigger and alias regex: match limit',
+        behaviour:
+            'Desktop compiles trigger and alias patterns with PCRE2\'s default match limit (10 000 000) and runs '
+            + 'them through the JIT. Mudlet Web caps them at 500 000 steps (ENGINE_MATCH_LIMIT in '
+            + 'src/mud/triggers/pcre/Pcre2.ts). A pattern that needs between the two to decide a line matches on '
+            + 'desktop and counts as no match here, silently on both clients (TTrigger::match_perl treats a match '
+            + 'error as no match). Ordinary patterns need a few tens of thousands of steps even on a 20 kB line, '
+            + 'so in practice only nested-quantifier patterns like ^(\\w+\\s?)+$ reach the limit, and those fail '
+            + 'on such lines on both clients anyway. Lua rex keeps the library default.',
+        reason:
+            'The wasm build has no JIT (sljit has no WebAssembly backend) and its interpreter takes about 50 ns '
+            + 'a step, so 10 000 000 steps froze the page for one to several seconds per line, for a pattern that '
+            + 'then failed anyway (#435). 500 000 gives up in tens of milliseconds. Matching the default would '
+            + 'bring the freeze back; running matching off the main thread would not shorten it, only hide it. '
+            + 'Pinned by tests/triggers/pcreLeadingDotPlus.test.ts.',
+        issue: '#435',
+    },
+    {
+        api: 'order of lines, GMCP, input and timers within one large network read',
+        behaviour:
+            'Desktop reads the socket in large chunks and processes each read in full '
+            + 'before typed input or a timer can run; GMCP and telnet negotiation in a read are handled before '
+            + 'its text lines. Mudlet Web processes a read of more than 32 lines in slices of 32 lines, handing '
+            + 'the page back to input and timers once a slice has run for 12 ms, and handles GMCP before the '
+            + 'lines of its own slice rather than of the whole read. Nothing is reordered: lines, prompts, GMCP '
+            + 'and sends keep their order, and a slice boundary is always between whole lines.',
+        reason:
+            'A browser tab is single-threaded, so processing a 5 000-line flood in one go blocked typing, '
+            + 'timers and rendering for seconds where desktop stays responsive (#435). Read boundaries already '
+            + 'differ from desktop\'s (the proxy and the WebSocket frame the stream their own way), so scripts '
+            + 'cannot depend on them on either client; slicing only adds more of them. Pinned by '
+            + 'tests/mud/connection/inboundSlices.test.ts.',
+        issue: '#435',
     },
     {
         api: 'postHTTP / putHTTP / deleteHTTP / customHTTP answered by a redirect',

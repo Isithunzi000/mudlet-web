@@ -1,4 +1,5 @@
 import { cursorForwardCount, scanEscape } from "../text/ansiEscapes";
+import { workerClock } from "../timers/workerClock";
 import {
     SERVER_WRAP_FLUSH_DELAY_MS,
     SERVER_WRAP_MAX_JOINED_LENGTH,
@@ -162,6 +163,13 @@ export class LineAssembler {
      *  the held one was already judged against the previous column. */
     setUndoServerWrapWidth(width: number): void {
         this.undoServerWrapWidth = width;
+    }
+
+    /** Nothing held back: no partial tail and no line waiting on a wrap
+     *  continuation, so no timer of ours has anything to fire on. MudClient
+     *  only pauses between slices of a large read at such a point. */
+    get idle(): boolean {
+        return this.pendingLineTail.length === 0 && this.serverWrapPending === null;
     }
 
     /** Drop all held state (call on connect and after close). */
@@ -389,7 +397,7 @@ export class LineAssembler {
     private startServerWrapTimer(): void {
         this.clearServerWrapTimer();
         this.serverWrapDeadline = Date.now() + SERVER_WRAP_FLUSH_DELAY_MS;
-        this.serverWrapTimer = window.setTimeout(() => {
+        this.serverWrapTimer = workerClock.setTimeout(() => {
             this.serverWrapTimer = null;
             this.serverWrapDeadline = null;
             if (this.commitServerWrapPending(Date.now())) this.callbacks.onIdleFlush();
@@ -398,15 +406,18 @@ export class LineAssembler {
 
     private clearServerWrapTimer(): void {
         if (this.serverWrapTimer !== null) {
-            clearTimeout(this.serverWrapTimer);
+            workerClock.clearTimeout(this.serverWrapTimer);
             this.serverWrapTimer = null;
         }
         this.serverWrapDeadline = null;
     }
 
+    // Both idle flushes run on the worker clock: a prompt without GA reaches
+    // prompt triggers after promptTimeoutMs in a hidden tab too, not on the
+    // next throttled main-thread wake-up (mudlet-web#441).
     private scheduleTailFlush(): void {
         if (this.pendingTailTimer !== null) return;
-        this.pendingTailTimer = window.setTimeout(() => {
+        this.pendingTailTimer = workerClock.setTimeout(() => {
             this.pendingTailTimer = null;
             if (this.pendingLineTail.length === 0) return;
             // A fragment with nothing to show — colour changes and other
@@ -424,7 +435,7 @@ export class LineAssembler {
 
     private clearTailTimer(): void {
         if (this.pendingTailTimer !== null) {
-            clearTimeout(this.pendingTailTimer);
+            workerClock.clearTimeout(this.pendingTailTimer);
             this.pendingTailTimer = null;
         }
     }

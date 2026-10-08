@@ -27,6 +27,7 @@ import { IndexedDB, WebAccess } from '@zenfs/dom';
 import { checkFolderPermission, loadFolderHandle } from './folderHandleStore';
 import { invalidateVfsPath } from './vfsBridge';
 import { FsError } from './fsErrors';
+import { commitSyncWritesImmediately } from './idbCommit';
 import { profileVfsDatabaseName } from '../../storage/profileStorage';
 import { whenIdbNamesMigrated } from '../../storage/storageMigration';
 
@@ -161,6 +162,7 @@ export class ProfileVFS {
                     const fs = disableAtime(await resolveMountConfig({ backend: WebAccess, handle }) as Syncable);
                     claimSlot();
                     mount(profilePath, fs);
+                    ensureProfileDirs(profilePath);
                     return new ProfileVFS(connectionId, fs, 'folder', handle);
                 } catch (err) {
                     console.warn('[ProfileVFS] folder mount failed, falling back to IDB:', err);
@@ -173,11 +175,11 @@ export class ProfileVFS {
         // fresh, empty filesystem alongside the real one.
         await whenIdbNamesMigrated();
         const fs = disableAtime(await resolveMountConfig({ backend: IndexedDB, storeName: profileVfsDatabaseName(connectionId) }) as Syncable);
+        // So a file written as the page closes (sysExitEvent) is kept — #438.
+        commitSyncWritesImmediately(fs);
         claimSlot();
         mount(profilePath, fs);
-        if (!existsSync(profilePath)) {
-            mkdirSync(profilePath, { recursive: true });
-        }
+        ensureProfileDirs(profilePath);
         return new ProfileVFS(connectionId, fs, 'idb');
     }
 
@@ -284,6 +286,21 @@ export class ProfileVFS {
         const abs = this.resolvePath(path);
         ensureParentDir(abs);
         appendFileSync(abs, content, 'utf8');
+        this.invalidate(abs);
+        this.afterWrite(abs, 'write');
+    }
+
+    /**
+     * Add `data` to the end of a file, creating it when missing — what Lua's
+     * io.open(f, "a") writes through, so an append costs what is appended
+     * rather than a read and rewrite of everything the file already holds. The
+     * read barrier runs first so the bytes land after anything a database still
+     * has pending for that file.
+     */
+    appendBinaryFile(path: string, data: Uint8Array): void {
+        const abs = this.beforeRead(this.resolvePath(path));
+        ensureParentDir(abs);
+        appendFileSync(abs, data);
         this.invalidate(abs);
         this.afterWrite(abs, 'write');
     }
@@ -595,6 +612,24 @@ function normalizePath(path: string): string {
         out.push(p);
     }
     return '/' + out.join('/');
+}
+
+/**
+ * The directories desktop makes every time a profile loads: the profile root
+ * and its `log` folder (Host's constructor mkpaths `<profile>/log`). Scripts
+ * write `getMudletHomeDir() .. "/log/..."` straight away, and `io.open` —
+ * rightly — won't create a missing parent, so the folder has to be there.
+ */
+function ensureProfileDirs(profilePath: string): void {
+    if (!existsSync(profilePath)) mkdirSync(profilePath, { recursive: true });
+    const log = `${profilePath}/log`;
+    // A file the user left named `log` is theirs; desktop's mkpath fails
+    // quietly over it too, and the profile still opens.
+    try {
+        if (!existsSync(log)) mkdirSync(log);
+    } catch (err) {
+        console.warn('[ProfileVFS] could not create the log directory:', err);
+    }
 }
 
 function ensureParentDir(absPath: string): void {
